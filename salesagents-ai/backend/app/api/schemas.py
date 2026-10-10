@@ -70,3 +70,19 @@ class AgentConfigResponse(BaseModel):
     agent_name: str
     agent_gender: str
     company_name: str
+
+
+class SpeakRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=2000)
+
+
+class AudioResponse(BaseModel):
+    call_id: UUID
+    transcript: str
+    stage: str
+    action: str
+    message: str
+    next_question: Optional[str] = None
+    end_call: bool = False
+    transfer_required: bool = False
+    status: str

@@ -9,6 +9,11 @@ class Settings(BaseSettings):
     AGENT_NAME: str = "Anjali"
     AGENT_GENDER: str = "female"
     COMPANY_NAME: str = "Home Credit"
+    FRONTEND_ORIGIN: str = "http://localhost:3000"
+    STT_PROVIDER: str = "mock"
+    TTS_PROVIDER: str = "mock"
+    STT_API_KEY: str = ""
+    TTS_API_KEY: str = ""
 
     model_config = {"env_file": "../.env", "extra": "ignore"}
 

@@ -1,6 +1,7 @@
 """Call session routes (Step 7: thin orchestration, no business rules)."""
 
 from datetime import datetime
+from typing import Any, Dict, Optional
 
 from fastapi import APIRouter
 
@@ -23,20 +24,26 @@ from app.models.call import CallSession, CallStatus
 from app.models.conversation import ConversationAction, MessageRole
 from app.models.qualification import QualificationState
 from app.services.conversation_service import ConversationService
-from app.services import prompt_service
+from app.services import prompt_service, response_extractor
 from app.services.eligibility_service import MAX_LOAN_AMOUNT
 
 router = APIRouter(prefix="/api/calls", tags=["calls"])
 
-AFFIRMATIVE = ("yes", "yeah", "yep", "sure", "okay", "this is", "speaking", "i am")
-NEGATIVE = ("no,", "no.", " not ", "wrong", "not me", "not interested")
-BUSY_WORDS = ("busy", "meeting", "later", "call back", "callback", "not now")
-TRANSFER_WORDS = ("existing loan", "already have", "balance transfer", "transfer", "reduce", "lower my")
 
-
-def _contains(text: str, words) -> bool:
-    text = f" {text.lower()} "
-    return any(w in text for w in words)
+def _apply_auto_extract(session: CallSession, svc: ConversationService, text: str) -> None:
+    """Fold natural-language slots into state; never raises."""
+    try:
+        auto = response_extractor.extract(text)
+    except Exception:
+        return
+    if not auto:
+        return
+    try:
+        updated = svc.qualification.update_state(session.qualification, auto)
+    except Exception:
+        return
+    for field in type(session.qualification).model_fields:
+        setattr(session.qualification, field, getattr(updated, field))
 
 
 def _append(session: CallSession, role: MessageRole, content: str) -> None:
@@ -195,44 +202,54 @@ def customer_message(call_id: str, request: CustomerMessageRequest):
     record = get_record_or_404(call_id)
     session: CallSession = record["session"]
     ensure_not_completed(session)
+    action = process_customer_message(record, request.message, request.extracted)
+    _apply_action(session, record, action)
+    return _to_response(session, action, CustomerMessageResponse)
+
+
+def process_customer_message(record, text: str, extracted: Optional[Dict[str, Any]] = None):
+    """Shared text/voice core: user text -> stage machine -> next action.
+
+    Both the text endpoint and the audio (STT) endpoint MUST use this so
+    voice and text produce identical business results.
+    """
+    session: CallSession = record["session"]
     svc = _service_for(record)
-    text = request.message
+    payload = dict(extracted or {})
     _append(session, MessageRole.USER, text)
     _prompt_boundary(record, text)
     stage = record["stage"]
 
     if stage in ("new", "verification"):
-        if _contains(text, BUSY_WORDS):
+        if response_extractor.is_busy(text):
             action = svc.mark_busy(session.qualification)
             record["stage"] = "done"
-        elif _contains(text, NEGATIVE) and not _contains(text, AFFIRMATIVE):
+        elif response_extractor.is_negative(text) and not response_extractor.is_affirmative(text):
             action = svc.verify(session.qualification, False)
             record["stage"] = "done"
         else:
             action = svc.verify(session.qualification, True)
+            _apply_auto_extract(session, svc, text)
             record["stage"] = "offer"
-        _apply_action(session, record, action)
-        if session.status == CallStatus.IN_PROGRESS:
-            session.status = CallStatus.IN_PROGRESS
-        return _to_response(session, action, CustomerMessageResponse)
+        return action
 
     if stage == "offer":
-        if _contains(text, BUSY_WORDS):
+        if response_extractor.is_busy(text):
             action = svc.mark_busy(session.qualification)
             record["stage"] = "done"
-        elif _contains(text, TRANSFER_WORDS):
-            action = svc.handle_turn(session.qualification, dict(request.extracted, existing_property_loan=True))
+        elif response_extractor.is_transfer_request(text):
+            action = svc.handle_turn(session.qualification, dict(payload, existing_property_loan=True))
             record["stage"] = "done"
-        elif _contains(text, NEGATIVE) and not _contains(text, AFFIRMATIVE):
+        elif response_extractor.is_negative(text) and not response_extractor.is_affirmative(text):
             action = svc.handle_offer_reply(session.qualification, interested=False)
             record["stage"] = "done"
         else:
-            if request.extracted:
+            if payload or response_extractor.extract(text):
                 # Accepted the offer and volunteered qualification data at once.
-                extracted = dict(request.extracted)
-                if _contains(text, TRANSFER_WORDS):
-                    extracted.setdefault("existing_property_loan", True)
-                action = svc.handle_turn(session.qualification, extracted)
+                merged = {**response_extractor.extract(text), **dict(payload)}
+                if response_extractor.is_transfer_request(text):
+                    merged.setdefault("existing_property_loan", True)
+                action = svc.handle_turn(session.qualification, merged)
                 loan = session.qualification.loan_amount
                 if loan is not None and loan > MAX_LOAN_AMOUNT:
                     record["downgrade_pending"] = True
@@ -240,15 +257,17 @@ def customer_message(call_id: str, request: CustomerMessageRequest):
             else:
                 action = svc.handle_offer_reply(session.qualification, interested=True)
                 record["stage"] = "qualification"
-        _apply_action(session, record, action)
-        return _to_response(session, action, CustomerMessageResponse)
+        return action
 
     # qualification stage
+    # The ₹75L confirmation is resolved FIRST; normal qualification logic
+    # must not run while it is pending.
     if record.get("downgrade_pending"):
-        if _contains(text, AFFIRMATIVE):
+        answer = response_extractor.downgrade_answer(text)
+        if answer is True:
             action = svc.confirm_loan_downgrade(session.qualification, True)
             record["downgrade_pending"] = False
-        elif _contains(text, NEGATIVE):
+        elif answer is False:
             action = svc.confirm_loan_downgrade(session.qualification, False)
             record["stage"] = "done"
         else:
@@ -267,17 +286,39 @@ def customer_message(call_id: str, request: CustomerMessageRequest):
                 ),
                 next_question="loan_amount",
             )
-        _apply_action(session, record, action)
-        return _to_response(session, action, CustomerMessageResponse)
+        return action
 
-    extracted = dict(request.extracted or {})
-    if _contains(text, TRANSFER_WORDS):
+    # Natural-language slots first; explicit harness/LLM payload wins ties.
+    # The currently-asked question routes context-free amounts (loan vs market).
+    pending_q = svc.qualification.get_next_question(session.qualification)
+    extracted = dict(response_extractor.extract(text, prefer=pending_q))
+    if (
+        session.qualification.documents_available is None
+        and "documents_available" not in extracted
+        and not payload
+        and svc.qualification.get_next_question(session.qualification) == "documents_available"
+    ):
+        # Bare "yes"/"no" answers the boolean question currently being asked.
+        if response_extractor.is_affirmative(text) and not response_extractor.is_negative(text):
+            extracted["documents_available"] = True
+        elif response_extractor.is_negative(text):
+            extracted["documents_available"] = False
+    extracted.update(payload or {})
+    if response_extractor.is_transfer_request(text):
         extracted.setdefault("existing_property_loan", True)
     action = svc.handle_turn(session.qualification, extracted)
     _loan = session.qualification.loan_amount
     if _loan is not None and _loan > MAX_LOAN_AMOUNT:
         record["downgrade_pending"] = True
+    if (
+        session.qualification.property_type is None
+        and action.next_question == "property_type"
+        and response_extractor.ambiguous_property(text)
+    ):
+        action.message = (
+            "Just to confirm — is your property residential, commercial, "
+            "industrial, or agricultural?"
+        )
     if action.end_call:
         record["stage"] = "done"
-    _apply_action(session, record, action)
-    return _to_response(session, action, CustomerMessageResponse)
+    return action
